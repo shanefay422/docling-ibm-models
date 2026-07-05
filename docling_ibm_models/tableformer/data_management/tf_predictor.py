@@ -113,7 +113,13 @@ class TFPredictor:
         self._log().info("Running on device: {}".format(device))
 
         self._is_cuda = isinstance(device, str) and device.startswith("cuda")
-        if self._is_cuda:
+        # TF32 + cudnn autotune, env/config-gated (TABLEFORMER_TF32=on|off,
+        # default on) so a single build can A/B against exact vanilla
+        # behavior. "off" leaves every backend flag untouched.
+        tf32 = os.environ.get(
+            "TABLEFORMER_TF32", config["predict"].get("tf32", "on")
+        ).lower()
+        if self._is_cuda and tf32 != "off":
             # TF32: ~free speedup for fp32 matmul/conv on Ampere+ (10-bit
             # mantissa, fp32 dynamic range).
             torch.backends.cuda.matmul.allow_tf32 = True
