@@ -2,6 +2,7 @@
 # Copyright IBM Corp. 2024 - 2024
 # SPDX-License-Identifier: MIT
 #
+import contextlib
 import glob
 import json
 import logging
@@ -111,6 +112,33 @@ class TFPredictor:
         self._device = device
         self._log().info("Running on device: {}".format(device))
 
+        self._is_cuda = isinstance(device, str) and device.startswith("cuda")
+        if self._is_cuda:
+            # TF32: ~free speedup for fp32 matmul/conv on Ampere+ (10-bit
+            # mantissa, fp32 dynamic range).
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Encoder input is always (N, 3, 448, 448) — fixed H×W, a handful
+            # of batch sizes — so cudnn autotuning pays for itself immediately.
+            torch.backends.cudnn.benchmark = True
+
+        # bf16 preferred: no loss-scaling and fp32-like dynamic range makes it
+        # the safer choice for the bbox regression head. Overridable via
+        # config predict.amp or env TABLEFORMER_AMP ("bf16" | "fp16" | "off").
+        self._amp_dtype = None
+        if self._is_cuda:
+            amp = os.environ.get(
+                "TABLEFORMER_AMP", config["predict"].get("amp", "bf16")
+            ).lower()
+            if amp == "fp16":
+                self._amp_dtype = torch.float16
+            elif amp != "off":
+                self._amp_dtype = (
+                    torch.bfloat16
+                    if torch.cuda.is_bf16_supported()
+                    else torch.float16
+                )
+
         self._config = config
         self.enable_post_process = True
 
@@ -136,6 +164,15 @@ class TFPredictor:
             AggProfiler(self._profiling_agg_window)
         else:
             AggProfiler()
+
+    def _autocast(self):
+        r"""Mixed-precision context for the model forward: bf16/fp16 autocast
+        on CUDA when enabled, otherwise a no-op. Weights stay fp32 (autocast
+        casts activations per-op); outputs are cast back to fp32 at the call
+        sites before any post-processing."""
+        if self._is_cuda and self._amp_dtype is not None:
+            return torch.autocast(device_type="cuda", dtype=self._amp_dtype)
+        return contextlib.nullcontext()
 
     def _init_word_map(self):
         self._prepared_data_dir = c.safe_get_parameter(
@@ -611,7 +648,7 @@ class TFPredictor:
         # Make predictions
         prediction = {}
 
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             # Compute predictions
             if (
                 eval_res_preds is not None
@@ -622,6 +659,12 @@ class TFPredictor:
                 pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
                     image_batch, max_steps, beam_size
                 )
+                # Autocast leaves activations in the low-precision dtype;
+                # post-processing (bbox math, argmax, .tolist()) must see fp32.
+                if outputs_coord is not None and torch.is_tensor(outputs_coord):
+                    outputs_coord = outputs_coord.float()
+                if outputs_class is not None and torch.is_tensor(outputs_class):
+                    outputs_class = outputs_class.float()
 
                 if outputs_coord is not None:
                     if len(outputs_coord) == 0:
@@ -739,7 +782,7 @@ class TFPredictor:
         # Make predictions
         prediction = {}
 
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast():
             # Compute predictions
             if (
                 eval_res_preds is not None
@@ -750,6 +793,12 @@ class TFPredictor:
                 pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
                     image_batch, max_steps, beam_size
                 )
+                # Autocast leaves activations in the low-precision dtype;
+                # post-processing (bbox math, argmax, .tolist()) must see fp32.
+                if outputs_coord is not None and torch.is_tensor(outputs_coord):
+                    outputs_coord = outputs_coord.float()
+                if outputs_class is not None and torch.is_tensor(outputs_class):
+                    outputs_class = outputs_class.float()
 
                 if outputs_coord is not None:
                     if len(outputs_coord) == 0:
