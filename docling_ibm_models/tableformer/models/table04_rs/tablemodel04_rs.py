@@ -104,6 +104,44 @@ class TableModel04_rs(BaseModel, nn.Module):
         bboxm = torch.tensor([new_cx, new_cy, new_w, new_h])
         return bboxm
 
+    def _merge_spans_v2(self, outputs_class, outputs_coord, bboxes_to_merge):
+        r"""Span-merge with one D2H transfer instead of ~3 per box: pull both
+        tensors to CPU once, then run the identical selection/merge logic on
+        CPU rows (mergebboxes is elementary IEEE fp only — bit-identical on
+        CPU; downstream consumes .tolist() so device doesn't matter). Gated
+        by TABLEFORMER_BBOX (v2 default, "off" = per-box .to() loop)."""
+        oc = outputs_coord.cpu()
+        ocl = outputs_class.cpu()
+
+        outputs_class1 = []
+        outputs_coord1 = []
+        boxes_to_skip = []
+
+        for box_ind in range(len(oc)):
+            box1 = oc[box_ind]
+            cls1 = ocl[box_ind]
+            if box_ind in bboxes_to_merge:
+                box2 = oc[bboxes_to_merge[box_ind]]
+                boxes_to_skip.append(bboxes_to_merge[box_ind])
+                boxm = self.mergebboxes(box1, box2)
+                outputs_coord1.append(boxm)
+                outputs_class1.append(cls1)
+            else:
+                if box_ind not in boxes_to_skip:
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
+
+        if len(outputs_coord1) > 0:
+            outputs_coord1 = torch.stack(outputs_coord1)
+        else:
+            outputs_coord1 = torch.empty(0)
+        if len(outputs_class1) > 0:
+            outputs_class1 = torch.stack(outputs_class1)
+        else:
+            outputs_class1 = torch.empty(0)
+
+        return outputs_class1, outputs_coord1
+
     def predict(self, imgs, max_steps, k, return_attention=False):
         r"""
         Inference.
@@ -293,35 +331,40 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Merge First and Last predicted BBOX for each span, according to bboxes_to_merge
         ########################################################################################
 
-        outputs_class1 = []
-        outputs_coord1 = []
-        boxes_to_skip = []
+        if os.environ.get("TABLEFORMER_BBOX", "v2") != "off":
+            outputs_class, outputs_coord = self._merge_spans_v2(
+                outputs_class, outputs_coord, bboxes_to_merge
+            )
+        else:
+            outputs_class1 = []
+            outputs_coord1 = []
+            boxes_to_skip = []
 
-        for box_ind in range(len(outputs_coord)):
-            box1 = outputs_coord[box_ind].to(self._device)
-            cls1 = outputs_class[box_ind].to(self._device)
-            if box_ind in bboxes_to_merge:
-                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
-                boxes_to_skip.append(bboxes_to_merge[box_ind])
-                boxm = self.mergebboxes(box1, box2).to(self._device)
-                outputs_coord1.append(boxm)
-                outputs_class1.append(cls1)
-            else:
-                if box_ind not in boxes_to_skip:
-                    outputs_coord1.append(box1)
+            for box_ind in range(len(outputs_coord)):
+                box1 = outputs_coord[box_ind].to(self._device)
+                cls1 = outputs_class[box_ind].to(self._device)
+                if box_ind in bboxes_to_merge:
+                    box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
+                    boxes_to_skip.append(bboxes_to_merge[box_ind])
+                    boxm = self.mergebboxes(box1, box2).to(self._device)
+                    outputs_coord1.append(boxm)
                     outputs_class1.append(cls1)
+                else:
+                    if box_ind not in boxes_to_skip:
+                        outputs_coord1.append(box1)
+                        outputs_class1.append(cls1)
 
-        if len(outputs_coord1) > 0:
-            outputs_coord1 = torch.stack(outputs_coord1)
-        else:
-            outputs_coord1 = torch.empty(0)
-        if len(outputs_class1) > 0:
-            outputs_class1 = torch.stack(outputs_class1)
-        else:
-            outputs_class1 = torch.empty(0)
+            if len(outputs_coord1) > 0:
+                outputs_coord1 = torch.stack(outputs_coord1)
+            else:
+                outputs_coord1 = torch.empty(0)
+            if len(outputs_class1) > 0:
+                outputs_class1 = torch.stack(outputs_class1)
+            else:
+                outputs_class1 = torch.empty(0)
 
-        outputs_class = outputs_class1
-        outputs_coord = outputs_coord1
+            outputs_class = outputs_class1
+            outputs_coord = outputs_coord1
 
         # Do the rest of the steps...
         AggProfiler().end("predict_total", self._prof)
@@ -481,35 +524,40 @@ class TableModel04_rs(BaseModel, nn.Module):
         outputs_class.to(self._device)
         outputs_coord.to(self._device)
 
-        outputs_class1 = []
-        outputs_coord1 = []
-        boxes_to_skip = []
+        if os.environ.get("TABLEFORMER_BBOX", "v2") != "off":
+            outputs_class, outputs_coord = self._merge_spans_v2(
+                outputs_class, outputs_coord, bboxes_to_merge
+            )
+        else:
+            outputs_class1 = []
+            outputs_coord1 = []
+            boxes_to_skip = []
 
-        for box_ind in range(len(outputs_coord)):
-            box1 = outputs_coord[box_ind].to(self._device)
-            cls1 = outputs_class[box_ind].to(self._device)
-            if box_ind in bboxes_to_merge:
-                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
-                boxes_to_skip.append(bboxes_to_merge[box_ind])
-                boxm = self.mergebboxes(box1, box2).to(self._device)
-                outputs_coord1.append(boxm)
-                outputs_class1.append(cls1)
-            else:
-                if box_ind not in boxes_to_skip:
-                    outputs_coord1.append(box1)
+            for box_ind in range(len(outputs_coord)):
+                box1 = outputs_coord[box_ind].to(self._device)
+                cls1 = outputs_class[box_ind].to(self._device)
+                if box_ind in bboxes_to_merge:
+                    box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
+                    boxes_to_skip.append(bboxes_to_merge[box_ind])
+                    boxm = self.mergebboxes(box1, box2).to(self._device)
+                    outputs_coord1.append(boxm)
                     outputs_class1.append(cls1)
+                else:
+                    if box_ind not in boxes_to_skip:
+                        outputs_coord1.append(box1)
+                        outputs_class1.append(cls1)
 
-        if len(outputs_coord1) > 0:
-            outputs_coord1 = torch.stack(outputs_coord1)
-        else:
-            outputs_coord1 = torch.empty(0)
-        if len(outputs_class1) > 0:
-            outputs_class1 = torch.stack(outputs_class1)
-        else:
-            outputs_class1 = torch.empty(0)
+            if len(outputs_coord1) > 0:
+                outputs_coord1 = torch.stack(outputs_coord1)
+            else:
+                outputs_coord1 = torch.empty(0)
+            if len(outputs_class1) > 0:
+                outputs_class1 = torch.stack(outputs_class1)
+            else:
+                outputs_class1 = torch.empty(0)
 
-        outputs_class = outputs_class1
-        outputs_coord = outputs_coord1
+            outputs_class = outputs_class1
+            outputs_coord = outputs_coord1
 
         AggProfiler().end("predict_total", self._prof)
         num_tab_cells = seq.count(4) + seq.count(5)
