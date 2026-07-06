@@ -36,6 +36,13 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[: x.size(0), :]
         return self.dropout(x)
 
+    def forward_at(self, x, pos: int):
+        r"""Positional encoding for a single position: identical to the row
+        `forward` would produce at index `pos`, without materializing PE over
+        the whole sequence. Used by the incremental decode path."""
+        x = x + self.pe[pos : pos + 1, :]
+        return self.dropout(x)
+
 
 class TMTransformerDecoder(nn.TransformerDecoder):
     def forward(  # type: ignore
