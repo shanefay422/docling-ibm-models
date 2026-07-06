@@ -463,6 +463,40 @@ class TFPredictor:
         # return the resized image
         return resized, sf
 
+    def _batch_forward(self, iocr_page, table_bboxes):
+        r"""Batched model forward for all tables of a page (spec 04 §2.2).
+
+        Reproduces the per-table crop prep of the serial loop on COPIES of
+        the bboxes (the caller loop scales/unscales the originals itself),
+        stacks the prepared crops, and runs predict_batch in chunks of
+        TABLEFORMER_MAX_TABLE_BATCH (default 8, VRAM cap). Returns a list of
+        (tag_seq, outputs_class, outputs_coord) aligned with table_bboxes.
+        """
+        max_steps = self._config["predict"]["max_steps"]
+        beam_size = self._config["predict"]["beam_size"]
+        cap = max(1, int(os.environ.get("TABLEFORMER_MAX_TABLE_BATCH", "8")))
+
+        page_image_resized, scale_factor = self.resize_img(
+            iocr_page["image"], height=1024
+        )
+        imgs = []
+        for tbl in table_bboxes:
+            sb = [c * scale_factor for c in tbl]
+            crop = page_image_resized[
+                round(sb[1]) : round(sb[3]), round(sb[0]) : round(sb[2])
+            ]
+            imgs.append(self._prepare_image(crop))
+
+        pre = []
+        with torch.no_grad():
+            for i in range(0, len(imgs), cap):
+                chunk = torch.cat(imgs[i : i + cap], dim=0)
+                seqs, classes, coords = self._model.predict_batch(
+                    chunk, max_steps, beam_size
+                )
+                pre.extend(zip(seqs, classes, coords))
+        return pre
+
     def multi_table_predict(
         self,
         iocr_page,
@@ -474,10 +508,22 @@ class TFPredictor:
         multi_tf_output = []
         page_image = iocr_page["image"]
 
+        # spec 04 §2.2: one batched GPU forward for all tables, then the
+        # unchanged per-table matching/post-process loop consumes it via
+        # predict(precomputed=...). Engages only for real multi-table calls.
+        precomputed_all = None
+        if (
+            os.environ.get("TABLEFORMER_MULTITABLE", "v2") != "off"
+            and len(table_bboxes) > 1
+            and do_matching
+            and self._config["predict"]["bbox"]
+        ):
+            precomputed_all = self._batch_forward(iocr_page, table_bboxes)
+
         # Prevent large image submission, by resizing input
         page_image_resized, scale_factor = self.resize_img(page_image, height=1024)
 
-        for table_bbox in table_bboxes:
+        for _tbl_idx, table_bbox in enumerate(table_bboxes):
             # Downscale table bounding box to the size of new image
             table_bbox[0] = table_bbox[0] * scale_factor
             table_bbox[1] = table_bbox[1] * scale_factor
@@ -498,6 +544,11 @@ class TFPredictor:
                     scale_factor,
                     None,
                     correct_overlapping_cells,
+                    precomputed=(
+                        precomputed_all[_tbl_idx]
+                        if precomputed_all is not None
+                        else None
+                    ),
                 )
             else:
                 tf_responses, predict_details = self.predict_dummy(
@@ -710,6 +761,7 @@ class TFPredictor:
         scale_factor,
         eval_res_preds=None,
         correct_overlapping_cells=False,
+        precomputed=None,
     ):
         r"""
         Predict the table out of an image in memory
@@ -722,6 +774,9 @@ class TFPredictor:
             Ready predictions provided by the evaluation results
         correct_overlapping_cells : boolean
             Enables or disables last post-processing step, that fixes cell bboxes to remove overlap
+        precomputed : tuple, optional
+            (tag_seq, outputs_class, outputs_coord) from a batched forward
+            (spec 04 §2.2): skip image prep + model call, keep the rest
 
         Returns
         -------
@@ -735,7 +790,9 @@ class TFPredictor:
 
         max_steps = self._config["predict"]["max_steps"]
         beam_size = self._config["predict"]["beam_size"]
-        image_batch = self._prepare_image(table_image)
+        image_batch = (
+            None if precomputed is not None else self._prepare_image(table_image)
+        )
         # Make predictions
         prediction = {}
 
@@ -747,9 +804,12 @@ class TFPredictor:
                 prediction["bboxes"] = eval_res_preds["bboxes"]
                 pred_tag_seq = eval_res_preds["tag_seq"]
             elif self._config["predict"]["bbox"]:
-                pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
-                    image_batch, max_steps, beam_size
-                )
+                if precomputed is not None:
+                    pred_tag_seq, outputs_class, outputs_coord = precomputed
+                else:
+                    pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
+                        image_batch, max_steps, beam_size
+                    )
 
                 if outputs_coord is not None:
                     if len(outputs_coord) == 0:
@@ -771,9 +831,12 @@ class TFPredictor:
                 if self._remove_padding:
                     pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
             else:
-                pred_tag_seq, _, _ = self._model.predict(
-                    image_batch, max_steps, beam_size
-                )
+                if precomputed is not None:
+                    pred_tag_seq = precomputed[0]
+                else:
+                    pred_tag_seq, _, _ = self._model.predict(
+                        image_batch, max_steps, beam_size
+                    )
                 # Check if padding should be removed
                 if self._remove_padding:
                     pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
