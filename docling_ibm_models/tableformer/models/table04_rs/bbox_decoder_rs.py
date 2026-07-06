@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 #
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -130,6 +131,8 @@ class BBoxDecoder(nn.Module):
         """
         Inference on test images with beam search
         """
+        if os.environ.get("TABLEFORMER_BBOX", "v2") != "off":
+            return self._inference_v2(encoder_out, tag_H)
         if hasattr(self, "_input_filter"):
             encoder_out = self._input_filter(encoder_out.permute(0, 3, 1, 2)).permute(
                 0, 2, 3, 1
@@ -165,4 +168,38 @@ class BBoxDecoder(nn.Module):
         else:
             predictions_classes = torch.empty(0)
 
+        return predictions_classes, predictions_bboxes
+
+    def _inference_v2(self, encoder_out, tag_H):
+        r"""Batched equivalent of the per-cell loop in `inference`: one
+        attention/MLP pass over all cells (batch = num_cells) instead of
+        num_cells passes at batch 1. Identical math; batched GEMM may
+        reorder fp reductions (gate: bbox L-inf <= 1e-4). Gated by
+        TABLEFORMER_BBOX (v2 default, "off" = per-cell loop)."""
+        if hasattr(self, "_input_filter"):
+            encoder_out = self._input_filter(encoder_out.permute(0, 3, 1, 2)).permute(
+                0, 2, 3, 1
+            )
+
+        encoder_dim = encoder_out.size(3)
+
+        # Flatten encoding (1, num_pixels, encoder_dim)
+        encoder_out = encoder_out.view(1, -1, encoder_dim)
+
+        num_cells = len(tag_H)
+        if num_cells == 0:
+            return torch.empty(0), torch.empty(0)
+
+        tagH = torch.cat(tag_H, dim=0)  # (num_cells, tag_decoder_dim)
+        # _init_hidden_state depends only on encoder_out: compute once,
+        # .expand is a free broadcast to (num_cells, decoder_dim)
+        h = self._init_hidden_state(encoder_out, num_cells)
+        # CellAttention already broadcasts (1, P, A) against (num_cells, 1, A)
+        awe, _ = self._attention(encoder_out, tagH, h)
+        gate = self._sigmoid(self._f_beta(h))
+        awe = gate * awe
+        h = awe * h
+
+        predictions_bboxes = self._bbox_embed(h).sigmoid()  # (num_cells, 4)
+        predictions_classes = self._class_embed(h)  # (num_cells, num_classes+1)
         return predictions_classes, predictions_bboxes
