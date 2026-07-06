@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -123,6 +124,14 @@ class TableModel04_rs(BaseModel, nn.Module):
         outputs_coord : tensor(x, 4)
             Coords of predicted bboxes. x is the number of bboxes. Each bbox is in [cxcywh] format
         """
+        # Incremental decode path (preallocated token/embedding buffers,
+        # embed each token exactly once at its position): mathematically
+        # identical to the stock loop — embedding is an index lookup and PE a
+        # deterministic per-position add; dropout is inactive in eval. Gated
+        # so A/B can compare against the untouched stock loop below
+        # (TABLEFORMER_DECODE=off).
+        if os.environ.get("TABLEFORMER_DECODE", "v2") != "off":
+            return self._predict_v2(imgs, max_steps, k, return_attention)
         AggProfiler().begin("predict_total", self._prof)
 
         # Invoke encoder
@@ -315,6 +324,193 @@ class TableModel04_rs(BaseModel, nn.Module):
         outputs_coord = outputs_coord1
 
         # Do the rest of the steps...
+        AggProfiler().end("predict_total", self._prof)
+        num_tab_cells = seq.count(4) + seq.count(5)
+        num_rows = seq.count(9)
+        self._log().info(
+            "OTSL predicted table cells#: {}; rows#: {}".format(num_tab_cells, num_rows)
+        )
+        return seq, outputs_class, outputs_coord
+
+    def _predict_v2(self, imgs, max_steps, k, return_attention=False):
+        r"""Incremental-decode variant of `predict` (spec 02 §2.1+§2.2):
+        preallocated token/embedding buffers replace the per-step
+        cat/realloc/H2D churn and the O(L²) full-sequence re-embed. Each
+        token is embedded exactly once at its position; the decoder receives
+        a view of the embedded buffer, so its inputs are bit-identical to the
+        stock loop's. Structure-correction logic is copied verbatim."""
+        AggProfiler().begin("predict_total", self._prof)
+
+        self._tag_transformer.eval()
+        enc_out = self._encoder(imgs)
+        AggProfiler().end("model_encoder", self._prof)
+
+        word_map = self._init_data["word_map"]["word_map_tag"]
+        n_heads = self._tag_transformer._n_heads
+        encoder_out = self._tag_transformer._input_filter(
+            enc_out.permute(0, 3, 1, 2)
+        ).permute(0, 2, 3, 1)
+
+        batch_size = encoder_out.size(0)
+        encoder_dim = encoder_out.size(-1)
+        enc_inputs = encoder_out.view(batch_size, -1, encoder_dim).to(self._device)
+        enc_inputs = enc_inputs.permute(1, 0, 2)
+        positions = enc_inputs.shape[0]
+
+        encoder_mask = torch.zeros(
+            (batch_size * n_heads, positions, positions), device=self._device
+        ) == torch.ones(
+            (batch_size * n_heads, positions, positions), device=self._device
+        )
+
+        AggProfiler().begin("model_tag_transformer_encoder", self._prof)
+        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=encoder_mask)
+        AggProfiler().end("model_tag_transformer_encoder", self._prof)
+
+        embedding = self._tag_transformer._embedding
+        pos_enc = self._tag_transformer._positional_encoding
+        max_len = self._max_pred_len + 2  # <start> + tags + <end>
+        tok_buf = torch.empty((max_len, 1), dtype=torch.long, device=self._device)
+        emb_buf = torch.empty(
+            (max_len, 1, embedding.embedding_dim),
+            dtype=embedding.weight.dtype,
+            device=self._device,
+        )
+        tok_buf[0, 0] = word_map["<start>"]
+        emb_buf[0:1] = pos_enc.forward_at(embedding(tok_buf[0:1]), 0)
+        seq_len = 1
+
+        output_tags = []
+        cache = None
+        tag_H_buf = []
+
+        skip_next_tag = True
+        prev_tag_ucel = False
+        line_num = 0
+
+        first_lcel = True
+        bboxes_to_merge = {}
+        cur_bbox_ind = -1
+        bbox_ind = 0
+
+        while len(output_tags) < self._max_pred_len:
+            decoded_embedding = emb_buf[:seq_len]
+            AggProfiler().begin("model_tag_transformer_decoder", self._prof)
+            decoded, cache = self._tag_transformer._decoder(
+                decoded_embedding,
+                encoder_out,
+                cache,
+                memory_key_padding_mask=encoder_mask,
+            )
+            AggProfiler().end("model_tag_transformer_decoder", self._prof)
+            AggProfiler().begin("model_tag_transformer_fc", self._prof)
+            logits = self._tag_transformer._fc(decoded[-1, :, :])
+            AggProfiler().end("model_tag_transformer_fc", self._prof)
+            new_tag = logits.argmax(1).item()
+
+            # STRUCTURE ERROR CORRECTION (verbatim from stock loop)
+            if line_num == 0:
+                if new_tag == word_map["xcel"]:
+                    new_tag = word_map["lcel"]
+
+            if prev_tag_ucel:
+                if new_tag == word_map["lcel"]:
+                    new_tag = word_map["fcel"]
+
+            if new_tag == word_map["<end>"]:
+                output_tags.append(new_tag)
+                tok_buf[seq_len, 0] = new_tag
+                emb_buf[seq_len : seq_len + 1] = pos_enc.forward_at(
+                    embedding(tok_buf[seq_len : seq_len + 1]), seq_len
+                )
+                seq_len += 1
+                break
+            output_tags.append(new_tag)
+
+            if not skip_next_tag:
+                if new_tag in [
+                    word_map["fcel"],
+                    word_map["ecel"],
+                    word_map["ched"],
+                    word_map["rhed"],
+                    word_map["srow"],
+                    word_map["nl"],
+                    word_map["ucel"],
+                ]:
+                    tag_H_buf.append(decoded[-1, :, :])
+                    if first_lcel is not True:
+                        bboxes_to_merge[cur_bbox_ind] = bbox_ind
+                    bbox_ind += 1
+
+            if new_tag != word_map["lcel"]:
+                first_lcel = True
+            else:
+                if first_lcel:
+                    tag_H_buf.append(decoded[-1, :, :])
+                    first_lcel = False
+                    cur_bbox_ind = bbox_ind
+                    bboxes_to_merge[cur_bbox_ind] = -1
+                    bbox_ind += 1
+
+            if new_tag in [word_map["nl"], word_map["ucel"], word_map["xcel"]]:
+                skip_next_tag = True
+            else:
+                skip_next_tag = False
+
+            if new_tag == word_map["ucel"]:
+                prev_tag_ucel = True
+            else:
+                prev_tag_ucel = False
+
+            tok_buf[seq_len, 0] = new_tag
+            emb_buf[seq_len : seq_len + 1] = pos_enc.forward_at(
+                embedding(tok_buf[seq_len : seq_len + 1]), seq_len
+            )
+            seq_len += 1
+        seq = tok_buf[:seq_len].squeeze().tolist()
+
+        if self._bbox:
+            AggProfiler().begin("model_bbox_decoder", self._prof)
+            outputs_class, outputs_coord = self._bbox_decoder.inference(
+                enc_out, tag_H_buf
+            )
+            AggProfiler().end("model_bbox_decoder", self._prof)
+        else:
+            outputs_class, outputs_coord = None, None
+
+        outputs_class.to(self._device)
+        outputs_coord.to(self._device)
+
+        outputs_class1 = []
+        outputs_coord1 = []
+        boxes_to_skip = []
+
+        for box_ind in range(len(outputs_coord)):
+            box1 = outputs_coord[box_ind].to(self._device)
+            cls1 = outputs_class[box_ind].to(self._device)
+            if box_ind in bboxes_to_merge:
+                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
+                boxes_to_skip.append(bboxes_to_merge[box_ind])
+                boxm = self.mergebboxes(box1, box2).to(self._device)
+                outputs_coord1.append(boxm)
+                outputs_class1.append(cls1)
+            else:
+                if box_ind not in boxes_to_skip:
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
+
+        if len(outputs_coord1) > 0:
+            outputs_coord1 = torch.stack(outputs_coord1)
+        else:
+            outputs_coord1 = torch.empty(0)
+        if len(outputs_class1) > 0:
+            outputs_class1 = torch.stack(outputs_class1)
+        else:
+            outputs_class1 = torch.empty(0)
+
+        outputs_class = outputs_class1
+        outputs_coord = outputs_coord1
+
         AggProfiler().end("predict_total", self._prof)
         num_tab_cells = seq.count(4) + seq.count(5)
         num_rows = seq.count(9)
