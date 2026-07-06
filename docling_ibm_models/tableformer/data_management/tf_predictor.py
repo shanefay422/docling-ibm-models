@@ -504,6 +504,7 @@ class TFPredictor:
         do_matching=True,
         correct_overlapping_cells=False,
         sort_row_col_indexes=True,
+        tokens_per_table=None,
     ):
         multi_tf_output = []
         page_image = iocr_page["image"]
@@ -519,6 +520,20 @@ class TFPredictor:
             and self._config["predict"]["bbox"]
         ):
             precomputed_all = self._batch_forward(iocr_page, table_bboxes)
+        elif (
+            os.environ.get("TABLEFORMER_MULTITABLE", "v2") != "off"
+            and do_matching
+            and self._config["predict"]["bbox"]
+        ):
+            # spec 04 §2.5 prefetch protocol: a caller-side page hook may have
+            # batch-forwarded ALL tables of this page already and stashed the
+            # results on the predictor, keyed by the exact bbox values it was
+            # given. Serial per-table caller loops then hit the stash here.
+            stash = getattr(self, "_prefetched_forwards", None)
+            if stash:
+                hits = [stash.pop(tuple(b), None) for b in table_bboxes]
+                if all(h is not None for h in hits):
+                    precomputed_all = hits
 
         # Prevent large image submission, by resizing input
         page_image_resized, scale_factor = self.resize_img(page_image, height=1024)
@@ -535,6 +550,11 @@ class TFPredictor:
                 round(table_bbox[0]) : round(table_bbox[2]),
             ]
             # table_image = page_image
+            # spec 04 §2.5: batched callers pass per-table tokens instead of
+            # overwriting iocr_page["tokens"] once per serial call — identical
+            # matching semantics to the upstream per-table caller loop
+            if tokens_per_table is not None:
+                iocr_page["tokens"] = tokens_per_table[_tbl_idx]
             # Predict
             if do_matching:
                 tf_responses, predict_details = self.predict(
