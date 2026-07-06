@@ -566,3 +566,194 @@ class TableModel04_rs(BaseModel, nn.Module):
             "OTSL predicted table cells#: {}; rows#: {}".format(num_tab_cells, num_rows)
         )
         return seq, outputs_class, outputs_coord
+
+    def predict_batch(self, imgs, max_steps, k, return_attention=False):
+        r"""Batched inference over B tables in one forward (spec 04 §2.3).
+
+        Generalizes `_predict_v2` to batch = B: one encoder + tag-encoder
+        pass on (B,...), one decoder call per step for all B lanes, ONE
+        `.tolist()` host sync per step (vs B `.item()` syncs serially).
+        There is no cross-lane attention, so each lane's outputs match its
+        solo run up to batched-GEMM fp reduction order. A lane that emits
+        <end> is marked done: its recorded sequence is frozen and <end> is
+        force-fed at later steps to keep the buffers rectangular (padding
+        never read back). Structure-correction state is per-lane arrays;
+        the logic is verbatim from `_predict_v2`. bbox decode + span merge
+        run per lane on that lane's encoder features (cheap vs decode).
+
+        Returns (seqs, classes, coords): per-lane lists, each element as
+        `predict` would return for that table alone.
+        """
+        AggProfiler().begin("predict_total", self._prof)
+
+        self._tag_transformer.eval()
+        enc_out = self._encoder(imgs)
+        AggProfiler().end("model_encoder", self._prof)
+
+        word_map = self._init_data["word_map"]["word_map_tag"]
+        n_heads = self._tag_transformer._n_heads
+        encoder_out = self._tag_transformer._input_filter(
+            enc_out.permute(0, 3, 1, 2)
+        ).permute(0, 2, 3, 1)
+
+        batch_size = encoder_out.size(0)
+        encoder_dim = encoder_out.size(-1)
+        enc_inputs = encoder_out.view(batch_size, -1, encoder_dim).to(self._device)
+        enc_inputs = enc_inputs.permute(1, 0, 2)
+        positions = enc_inputs.shape[0]
+
+        encoder_mask = torch.zeros(
+            (batch_size * n_heads, positions, positions), device=self._device
+        ) == torch.ones(
+            (batch_size * n_heads, positions, positions), device=self._device
+        )
+
+        AggProfiler().begin("model_tag_transformer_encoder", self._prof)
+        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=encoder_mask)
+        AggProfiler().end("model_tag_transformer_encoder", self._prof)
+
+        embedding = self._tag_transformer._embedding
+        pos_enc = self._tag_transformer._positional_encoding
+        max_len = self._max_pred_len + 2  # <start> + tags + <end>
+        tok_buf = torch.empty(
+            (max_len, batch_size), dtype=torch.long, device=self._device
+        )
+        emb_buf = torch.empty(
+            (max_len, batch_size, embedding.embedding_dim),
+            dtype=embedding.weight.dtype,
+            device=self._device,
+        )
+        tok_buf[0, :] = word_map["<start>"]
+        emb_buf[0:1] = pos_enc.forward_at(embedding(tok_buf[0:1]), 0)
+        seq_len = 1
+
+        end_tag = word_map["<end>"]
+        bbox_tags = {
+            word_map["fcel"],
+            word_map["ecel"],
+            word_map["ched"],
+            word_map["rhed"],
+            word_map["srow"],
+            word_map["nl"],
+            word_map["ucel"],
+        }
+        skip_tags = {word_map["nl"], word_map["ucel"], word_map["xcel"]}
+
+        # per-lane decode state (scalars in _predict_v2 -> arrays here)
+        done = [False] * batch_size
+        seq_lens = [1] * batch_size
+        skip_next_tag = [True] * batch_size
+        prev_tag_ucel = [False] * batch_size
+        line_num = [0] * batch_size
+        first_lcel = [True] * batch_size
+        bboxes_to_merge = [{} for _ in range(batch_size)]
+        cur_bbox_ind = [-1] * batch_size
+        bbox_ind = [0] * batch_size
+        tag_H_buf = [[] for _ in range(batch_size)]
+        cache = None
+
+        steps = 0
+        while steps < self._max_pred_len and not all(done):
+            decoded_embedding = emb_buf[:seq_len]
+            AggProfiler().begin("model_tag_transformer_decoder", self._prof)
+            decoded, cache = self._tag_transformer._decoder(
+                decoded_embedding,
+                encoder_out,
+                cache,
+                memory_key_padding_mask=encoder_mask,
+            )
+            AggProfiler().end("model_tag_transformer_decoder", self._prof)
+            AggProfiler().begin("model_tag_transformer_fc", self._prof)
+            logits = self._tag_transformer._fc(decoded[-1, :, :])
+            AggProfiler().end("model_tag_transformer_fc", self._prof)
+            new_tags = logits.argmax(1).tolist()  # one host sync for all lanes
+            last_H = decoded[-1, :, :]  # (B, D)
+
+            for b in range(batch_size):
+                if done[b]:
+                    tok_buf[seq_len, b] = end_tag  # rectangular pad, never read
+                    continue
+                new_tag = new_tags[b]
+
+                # STRUCTURE ERROR CORRECTION (verbatim from _predict_v2)
+                if line_num[b] == 0:
+                    if new_tag == word_map["xcel"]:
+                        new_tag = word_map["lcel"]
+
+                if prev_tag_ucel[b]:
+                    if new_tag == word_map["lcel"]:
+                        new_tag = word_map["fcel"]
+
+                if new_tag == end_tag:
+                    tok_buf[seq_len, b] = new_tag
+                    seq_lens[b] = seq_len + 1
+                    done[b] = True
+                    continue
+
+                if not skip_next_tag[b]:
+                    if new_tag in bbox_tags:
+                        tag_H_buf[b].append(last_H[b : b + 1, :])
+                        if first_lcel[b] is not True:
+                            bboxes_to_merge[b][cur_bbox_ind[b]] = bbox_ind[b]
+                        bbox_ind[b] += 1
+
+                if new_tag != word_map["lcel"]:
+                    first_lcel[b] = True
+                else:
+                    if first_lcel[b]:
+                        tag_H_buf[b].append(last_H[b : b + 1, :])
+                        first_lcel[b] = False
+                        cur_bbox_ind[b] = bbox_ind[b]
+                        bboxes_to_merge[b][cur_bbox_ind[b]] = -1
+                        bbox_ind[b] += 1
+
+                if new_tag in skip_tags:
+                    skip_next_tag[b] = True
+                else:
+                    skip_next_tag[b] = False
+
+                if new_tag == word_map["ucel"]:
+                    prev_tag_ucel[b] = True
+                else:
+                    prev_tag_ucel[b] = False
+
+                tok_buf[seq_len, b] = new_tag
+                seq_lens[b] = seq_len + 1
+
+            emb_buf[seq_len : seq_len + 1] = pos_enc.forward_at(
+                embedding(tok_buf[seq_len : seq_len + 1]), seq_len
+            )
+            seq_len += 1
+            steps += 1
+
+        seqs = []
+        classes_out = []
+        coords_out = []
+        for b in range(batch_size):
+            seq = tok_buf[: seq_lens[b], b].tolist()
+
+            if self._bbox:
+                AggProfiler().begin("model_bbox_decoder", self._prof)
+                outputs_class, outputs_coord = self._bbox_decoder.inference(
+                    enc_out[b : b + 1], tag_H_buf[b]
+                )
+                AggProfiler().end("model_bbox_decoder", self._prof)
+                outputs_class, outputs_coord = self._merge_spans_v2(
+                    outputs_class, outputs_coord, bboxes_to_merge[b]
+                )
+            else:
+                outputs_class, outputs_coord = None, None
+
+            num_tab_cells = seq.count(4) + seq.count(5)
+            num_rows = seq.count(9)
+            self._log().info(
+                "OTSL predicted table cells#: {}; rows#: {}".format(
+                    num_tab_cells, num_rows
+                )
+            )
+            seqs.append(seq)
+            classes_out.append(outputs_class)
+            coords_out.append(outputs_coord)
+
+        AggProfiler().end("predict_total", self._prof)
+        return seqs, classes_out, coords_out
